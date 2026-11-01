@@ -16,6 +16,7 @@ needs a route and is marked unchecked.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 
 from sqlalchemy import select
@@ -26,8 +27,9 @@ from app.db.session import session_scope
 from app.geo import load_boundaries
 from app.impact.engine import elevations, get_impact, haversine_km, pkey
 from app.plandb.store import district_records
+from app.sources import osm_snapshot, registry
 from app.sources.base import SourceError
-from app.sources.osm import fetch_assets
+from app.sources.osm import fetch_assets, normalise_assets
 
 TYPES_KEY = "assets:v1"
 LABELS = {"grain_storage": "Food / grain storage", "cold_storage": "Cold storage", "seed_store": "Seed store",
@@ -52,24 +54,80 @@ def _bbox(district_id: str) -> tuple[float, float, float, float]:
     return d.hq[0] - r, d.hq[1] - r, d.hq[0] + r, d.hq[1] + r
 
 
+_bg_tasks: set[asyncio.Task] = set()
+_refreshing: set[str] = set()
+
+
+def _store(district_id: str, fetch_id: str, feats: list[dict]) -> None:
+    with session_scope() as s:
+        s.add(FacilityCache(district_id=district_id, types_key=TYPES_KEY, fetch_id=fetch_id, features=feats))
+
+
+async def _refresh(district_id: str) -> None:
+    """Background Overpass refresh; a failure only means the cached/snapshot list stays on screen."""
+    if district_id in _refreshing or registry.recently_failed("overpass", 120):
+        return
+    _refreshing.add(district_id)
+    try:
+        res, feats = await fetch_assets(_bbox(district_id))
+        _store(district_id, res.fetch_id, feats)
+    except Exception:  # noqa: BLE001 - logged in source_fetches by fetch(); nothing to surface here
+        pass
+    finally:
+        _refreshing.discard(district_id)
+
+
+def _refresh_in_background(district_id: str) -> None:
+    t = asyncio.create_task(_refresh(district_id))
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
+def _snapshot_assets(district_id: str) -> list[dict] | None:
+    p = osm_snapshot.payload(district_id)
+    if p is None:
+        return None
+    s_, w, n, e = _bbox(district_id)
+    return [a for a in normalise_assets(p) if s_ <= a["lat"] <= n and w <= a["lon"] <= e]
+
+
 async def osm_assets(district_id: str, force: bool = False) -> tuple[list[dict], str | None, str | None]:
+    """Never waits on a public Overpass server unless nothing at all is known about the district.
+
+    fresh cache -> served; older cache or the bundled snapshot -> served at once and refreshed in
+    the background; explicit refresh (force) -> live call, falling back to what is known.
+    """
     ttl = dt.timedelta(hours=float(_cfg().get("cache_h", 24)))
     with session_scope() as s:
         row = s.execute(select(FacilityCache).where(FacilityCache.district_id == district_id,
                                                     FacilityCache.types_key == TYPES_KEY)
                         .order_by(FacilityCache.fetched_at.desc()).limit(1)).scalars().first()
-        if row and not force and utcnow() - row.fetched_at < ttl:
+        if row and not force and utcnow() - _aware(row.fetched_at) < ttl:
             return list(row.features), row.fetch_id, None
         stale = (list(row.features), row.fetch_id) if row else None
+    snap = None
+    if stale is None:
+        snap = _snapshot_assets(district_id)
+    if not force and (stale or snap is not None):
+        _refresh_in_background(district_id)
+        if stale:
+            return stale[0], stale[1], None
+        return snap, None, None
     try:
         res, feats = await fetch_assets(_bbox(district_id))
     except SourceError as exc:
         if stale:
             return stale[0], stale[1], f"OpenStreetMap unreachable; showing the last list ({exc})"[:240]
+        if snap is not None:
+            when = (osm_snapshot.fetched_at(district_id) or "")[:10]
+            return snap, None, f"OpenStreetMap unreachable; showing the bundled snapshot from {when}"[:240]
         return [], None, f"OpenStreetMap unreachable: {exc}"[:240]
-    with session_scope() as s:
-        s.add(FacilityCache(district_id=district_id, types_key=TYPES_KEY, fetch_id=res.fetch_id, features=feats))
+    _store(district_id, res.fetch_id, feats)
     return feats, res.fetch_id, None
+
+
+def _aware(t: dt.datetime) -> dt.datetime:
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
 
 
 def _nearest(cells: list[dict], lat: float, lon: float) -> dict | None:

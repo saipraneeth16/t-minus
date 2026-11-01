@@ -24,12 +24,14 @@ from app.geo import contains, district_box
 from app.rag import retrieve
 from app.sources.base import SourceError
 from app.sources.ors import circle_polygon, route
-from app.sources.osm import FACILITY_TYPES, fetch_facilities, geocode
+from app.sources import osm_snapshot
+from app.sources.osm import FACILITY_TYPES, fetch_facilities, geocode, normalise_elements
 
 
 TOOL_TIMEOUT_S = 45.0  # no single tool may stall a run (e.g. an unresponsive Overpass mirror)
 # Overpass is hedged across mirrors with an 85 s budget; give it room to finish instead of being cut off.
 TOOL_TIMEOUTS_S = {"find_facilities": 95.0}
+_BG: set[asyncio.Task] = set()  # background Overpass refreshes (strong refs until done)
 
 
 class BudgetExceeded(Exception):
@@ -286,28 +288,42 @@ async def t_find_facilities(ctx: ToolContext, args: dict) -> dict:
         elif cached:
             stale = (list(cached.features), cached.fetch_id)
     note = None
-    if feats is None:
+    box = district_box(d_cfg, boundary)
+
+    def inside(fs: list[dict]) -> list[dict]:
+        return [f for f in fs if box[0] <= f["lat"] <= box[2] and box[1] <= f["lon"] <= box[3]
+                and contains(boundary, f["lat"], f["lon"], d_cfg) is not False]
+
+    async def live() -> tuple[str, list[dict]]:
+        res, feats_all = await fetch_facilities(types, bbox=box)
+        got = inside(feats_all)
+        with session_scope() as s:
+            s.add(FacilityCache(district_id=ctx.district_id, types_key=key, fetch_id=res.fetch_id, features=got))
+        return res.fetch_id, got
+
+    if feats is None and stale is None:
+        snap = osm_snapshot.payload(ctx.district_id)
+        if snap is not None:
+            stale = ([f for f in inside(normalise_elements(snap)) if f["type"] in types], None)
+            note = f"OpenStreetMap snapshot from {(osm_snapshot.fetched_at(ctx.district_id) or '')[:10]}"
+    if feats is None and stale is not None:
+        # Serve what is known at once; refresh from Overpass without making the agent wait on it.
+        feats, fetch_id, cached_flag = stale[0], stale[1], True
+        note = note or "older than 24 h; a live refresh is running in the background"
         from app.sources import registry as _reg
 
-        broken = _reg.recently_failed("overpass", 120)
+        if not _reg.recently_failed("overpass", 120):
+            t = asyncio.create_task(live())
+            _BG.add(t)
+            t.add_done_callback(lambda t: (_BG.discard(t), t.cancelled() or t.exception()))
+    elif feats is None:
         try:
-            if broken:
-                raise SourceError("overpass", f"Overpass failed {broken}; circuit open for 2 minutes")
-            box = district_box(d_cfg, boundary)
-            res, feats_all = await fetch_facilities(types, bbox=box)
+            fetch_id, feats = await live()
+            cached_flag = False
         except SourceError as exc:
-            if exc.simulated or not stale:
-                return {"status": "error", "message": f"OpenStreetMap facilities unavailable — {exc.message}. "
-                                                      "Proceed without facility data.",
-                        "simulated": exc.simulated, "retryable": True}
-            # Facilities barely change day to day: an older real list beats no list.
-            feats, fetch_id, cached_flag = stale[0], stale[1], True
-            note = f"Overpass unreachable ({exc.message[:120]}); using the last fetched list (older than 24 h)."
-        else:
-            feats = [f for f in feats_all if contains(boundary, f["lat"], f["lon"], d_cfg) is not False]
-            fetch_id, cached_flag = res.fetch_id, False
-            with session_scope() as s:
-                s.add(FacilityCache(district_id=ctx.district_id, types_key=key, fetch_id=fetch_id, features=feats))
+            return {"status": "error", "message": f"OpenStreetMap facilities unavailable — {exc.message}. "
+                                                  "Proceed without facility data.",
+                    "simulated": exc.simulated, "retryable": True}
     for f in feats:
         ctx.facilities[f["id"]] = {**f, "fetch_id": fetch_id}
     named = [f for f in feats if f.get("name")]
