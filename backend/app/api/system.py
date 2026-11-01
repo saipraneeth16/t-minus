@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 
 from app import notify, scanner, scheduler
 from app.api.common import iso, last_scan
-from app.auth import User, _db_credentials, admin_user, current_user, issue_token, login
+from app.auth import User, _db_credentials, _file_credentials, admin_user, current_user, issue_token, login
 from app.config import get_settings
 from app.db.models import Approval, PlanDocument, ScanRun
 from app.db.session import session_scope
@@ -64,7 +64,7 @@ def health():
         "boundary_source": (prov or {}).get("source"),
         "chaos": registry.chaos_sources(),
         "tls_trust": trust_store_label(),
-        "login_configured": bool(get_settings().officer_passcode or get_settings().admin_passcode or _db_credentials()),
+        "login_configured": bool(get_settings().officer_passcode or get_settings().admin_passcode or _file_credentials() or _db_credentials()),
     }
 
 

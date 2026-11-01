@@ -1,0 +1,13 @@
+# Officer / admin sign-in passcodes, stored as SHA-256 hashes only (safe to commit:
+# a hash of a long random passcode cannot be turned back into the passcode).
+# Sign in with any display name plus the passcode itself. These work in addition to
+# OFFICER_PASSCODE / ADMIN_PASSCODE from the environment.
+#
+# To add or rotate one, hash the new passcode and replace the line:
+#   python -c "import hashlib,getpass; print(hashlib.sha256(getpass.getpass().encode()).hexdigest())"
+# Deleting a line revokes that passcode on the next deploy.
+credentials:
+  - role: admin
+    passcode_sha256: 85bf698250de6f680f0ba73e128f2445cf3e585eb9d294de0222802627c6ad47
+  - role: officer
+    passcode_sha256: 9ad87c830800a605e1f8a95c0c2276abf93bb2823f8ab606ea3c885203dc5586

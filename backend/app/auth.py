@@ -60,11 +60,11 @@ def login(name: str, passcode: str) -> User:
     name = (name or "").strip()
     if not _NAME_RE.match(name):
         raise APIError(422, "invalid_name", "Display name must be 2–64 letters, digits, spaces or basic punctuation.")
-    db_creds = _db_credentials()
+    db_creds = _file_credentials() + _db_credentials()
     if not s.officer_passcode and not s.admin_passcode and not db_creds:
         raise APIError(503, "login_not_configured",
-                       "Officer login is not configured: set OFFICER_PASSCODE and ADMIN_PASSCODE in the environment "
-                       "or add a row to the login_credentials table.")
+                       "Officer login is not configured: set OFFICER_PASSCODE and ADMIN_PASSCODE in the environment, "
+                       "list hashes in config/login.yaml, or add a row to the login_credentials table.")
     if s.admin_passcode and hmac.compare_digest(passcode.encode(), s.admin_passcode.encode()):
         return User(name, "admin")
     if s.officer_passcode and hmac.compare_digest(passcode.encode(), s.officer_passcode.encode()):
@@ -74,6 +74,26 @@ def login(name: str, passcode: str) -> User:
         if hmac.compare_digest(digest, stored):
             return User(name, role)
     raise APIError(401, "bad_credentials", "Wrong passcode.")
+
+
+def _file_credentials() -> list[tuple[str, str]]:
+    """(role, sha256 hex) pairs from ``config/login.yaml`` — hashes only, safe to commit."""
+    import os
+    from pathlib import Path
+
+    import yaml
+
+    p = Path(os.environ.get("CONFIG_DIR", get_settings().config_dir)) / "login.yaml"
+    try:
+        doc = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        return []
+    out = []
+    for c in doc.get("credentials") or []:
+        role, h = str(c.get("role", "")).strip().lower(), str(c.get("passcode_sha256", "")).strip().lower()
+        if role in ("officer", "admin") and re.fullmatch(r"[0-9a-f]{64}", h):
+            out.append((role, h))
+    return out
 
 
 def _db_credentials() -> list[tuple[str, str]]:

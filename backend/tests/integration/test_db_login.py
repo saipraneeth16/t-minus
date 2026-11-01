@@ -21,3 +21,15 @@ def test_database_passcode_logs_in_without_env_passcodes(fresh_db, monkeypatch):
     token = ok.json()["token"]
     assert c.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["user"]["role"] == "admin"
     assert c.post("/api/auth/login", json={"name": "Sai", "passcode": "wrong"}).status_code == 401
+
+
+def test_config_file_hash_logs_in(fresh_db, monkeypatch, tmp_path):
+    (tmp_path / "login.yaml").write_text(
+        "credentials:\n  - role: officer\n    passcode_sha256: " + hashlib.sha256(b"from-the-file-7").hexdigest() + "\n")
+    s = get_settings()
+    monkeypatch.setattr(s, "officer_passcode", "")
+    monkeypatch.setattr(s, "admin_passcode", "")
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    from app.auth import login
+
+    assert login("Sai", "from-the-file-7").role == "officer"
