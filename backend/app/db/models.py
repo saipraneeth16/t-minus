@@ -453,3 +453,17 @@ class PlaceName(Base):
     osm_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     fetch_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     fetched_at: Mapped[dt.datetime] = mapped_column(default=utcnow)
+
+
+class LoginCredential(Base):
+    """Extra officer/admin passcodes kept in the database (SHA-256 hashes only, never plaintext).
+
+    Lets whoever administers the database grant sign-in without access to the host's environment
+    variables. Add a row with role 'officer' or 'admin' and passcode_sha256 = sha256(passcode) as hex.
+    """
+
+    __tablename__ = "login_credentials"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    role: Mapped[str] = mapped_column(String(16))
+    passcode_sha256: Mapped[str] = mapped_column(String(64))
+    note: Mapped[str | None] = mapped_column(String(128), nullable=True)

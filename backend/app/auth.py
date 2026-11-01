@@ -60,14 +60,36 @@ def login(name: str, passcode: str) -> User:
     name = (name or "").strip()
     if not _NAME_RE.match(name):
         raise APIError(422, "invalid_name", "Display name must be 2–64 letters, digits, spaces or basic punctuation.")
-    if not s.officer_passcode and not s.admin_passcode:
+    db_creds = _db_credentials()
+    if not s.officer_passcode and not s.admin_passcode and not db_creds:
         raise APIError(503, "login_not_configured",
-                       "Officer login is not configured: set OFFICER_PASSCODE and ADMIN_PASSCODE in the environment.")
+                       "Officer login is not configured: set OFFICER_PASSCODE and ADMIN_PASSCODE in the environment "
+                       "or add a row to the login_credentials table.")
     if s.admin_passcode and hmac.compare_digest(passcode.encode(), s.admin_passcode.encode()):
         return User(name, "admin")
     if s.officer_passcode and hmac.compare_digest(passcode.encode(), s.officer_passcode.encode()):
         return User(name, "officer")
+    digest = hashlib.sha256(passcode.encode()).hexdigest()
+    for role, stored in sorted(db_creds, key=lambda c: c[0] != "admin"):  # admin wins if listed twice
+        if hmac.compare_digest(digest, stored):
+            return User(name, role)
     raise APIError(401, "bad_credentials", "Wrong passcode.")
+
+
+def _db_credentials() -> list[tuple[str, str]]:
+    """(role, sha256 hex) rows from the login_credentials table; empty if the table is unreachable."""
+    from sqlalchemy import select
+
+    from app.db.models import LoginCredential
+    from app.db.session import session_scope
+
+    try:
+        with session_scope() as s:
+            rows = s.execute(select(LoginCredential.role, LoginCredential.passcode_sha256)).all()
+    except Exception:  # noqa: BLE001 - a DB hiccup must not break env-based login
+        return []
+    return [(r.strip().lower(), h.strip().lower()) for r, h in rows
+            if r and h and r.strip().lower() in ("officer", "admin")]
 
 
 def current_user(authorization: str | None = Header(default=None)) -> User:
