@@ -1,0 +1,166 @@
+# T-Minus hazard configuration (spec §5.4).
+#
+# These are PARAMETERS, not data. Every threshold carries its source, or is
+# explicitly marked "starting value" (tunable; calibrated with replay, §6.10;
+# results recorded in docs/decisions.md).
+
+rain:
+  # Rolling accumulation window used for every rainfall category.
+  accumulation_window_h: 24
+
+  # IMD 24-hour rainfall intensity categories (India Meteorological Department
+  # terminology: heavy 64.5–115.5 mm, very heavy 115.6–204.4 mm,
+  # extremely heavy >= 204.5 mm). Values are the lower bounds.
+  categories_mm:
+    heavy: 64.5
+    very_heavy: 115.6
+    extremely_heavy: 204.5
+
+  # Trigger rules. A level fires if ANY of its rules is met:
+  # P(24-h total >= category threshold somewhere within the next `within_h`) >= min_prob.
+  # Rule shape follows Forecast-based Financing practice: danger level + probability + lead time.
+  levels:
+    WATCH:
+      - { category: very_heavy, min_prob: 0.30, within_h: 120 }
+    PREPARE:
+      - { category: very_heavy, min_prob: 0.50, within_h: 72 }
+    ACT:
+      - { category: very_heavy, min_prob: 0.70, within_h: 48 }
+      - { category: extremely_heavy, min_prob: 0.40, within_h: 72 }
+
+  # Official-alert floor (§6.5 step 2): orange => at least PREPARE, red => ACT.
+  official_alert_floor: { orange: PREPARE, red: ACT }
+
+  escalation:
+    # Saturated ground: rain over the past 72 h >= this value escalates +1 level.
+    antecedent_rain_72h_mm: 100      # starting value; calibrate with replay
+    # Compound hazard: rain >= PREPARE and river >= WATCH in the same district => +1.
+    compound_with_river: true
+    # Escalation is capped at +1 level in total and only amplifies an existing signal
+    # (it never lifts Quiet to WATCH on its own) — see docs/assumptions.md A-07.
+    max_levels: 1
+
+  stand_down:
+    prob_margin: 0.15                # stand down below (entry threshold - margin)
+    consecutive_model_runs: 2        # counted in NEW model runs, never in scans
+
+  # Below this share of the model's members valid => assessment marked "degraded".
+  min_valid_member_share: 0.8
+
+  # §6.3: earliest plausible onset = first hour at which >= 10% of members exceed X.
+  onset_member_share: 0.10
+
+  # §8.1: no new triggers on data older than this (starting value).
+  max_data_age_h: 6
+
+  # Category used for the headline card, t* and T-minus when no rule has fired.
+  headline_category: very_heavy
+
+river:
+  # GloFAS v4 reanalysis baseline used to compute each river point's own P95/P99.
+  baseline:
+    source: glofas_reanalysis
+    start: "1984-01-01"
+    end: "2022-07-31"
+  levels:
+    WATCH:   { statistic: ensemble_max,    above_percentile: 95, within_days: 7 }
+    PREPARE: { statistic: ensemble_median, above_percentile: 95, within_days: 7 }
+    ACT:     { statistic: ensemble_median, above_percentile: 99, within_days: 5 }
+  # A point returning null discharge is retried at +/- this offset (degrees), §8.1.
+  nudge_deg: 0.1
+  caveat: >-
+    GloFAS is a ~5 km global model. It represents large rivers far better than small
+    urban channels such as Chennai's Adyar and Cooum. Urban flooding is driven mainly
+    by intense rainfall, so rainfall is the primary trigger and the river signal is
+    supporting evidence.
+
+heat:
+  # STRETCH (F10). Outdoor WBGT bands — starting values from US Army TB MED 507
+  # heat categories (confirm and cite before relying on them operationally).
+  bands_c:
+    WATCH: 29.4
+    PREPARE: 31.1
+    ACT: 32.2
+  min_prob: 0.5                      # starting value: share of members reaching the band
+  within_days: 5
+
+public_message:
+  # §6.9 probability wording, always shown together with the number.
+  wording:
+    - { min_prob: 0.70, inclusive: true,  phrase: "very likely" }
+    - { min_prob: 0.50, inclusive: false, phrase: "likely" }
+    - { min_prob: 0.30, inclusive: true,  phrase: "possible" }
+  # Below the lowest band no public message is drafted.
+  english_max_chars: 160             # one GSM-7 SMS
+  tamil_max_chars: 134               # two UCS-2 segments (2 x 67)
+
+agent:
+  max_tool_calls: 20
+  max_plan_attempts: 3               # initial + 2 retries
+  soft_timeout_s: 120
+  retrieval_k: 6
+  # Hybrid retrieval relevance gate (starting values, calibrated 2026-10-31 on the real
+  # GCC Chennai CDMP 2025 and Puducherry DM Action Plan 2023). A chunk is "found" if
+  #   (coverage >= min_coverage AND cosine >= min_cosine)   moderate keywords + some similarity
+  #   OR coverage >= strong_coverage                         most query words present
+  #   OR cosine >= strong_cosine                             strong similarity alone
+  # otherwise retrieve_plan answers not_found ("Not found in district plan").
+  retrieval_min_coverage: 0.5
+  retrieval_min_cosine: 0.45
+  retrieval_min_cosine_tfidf: 0.15
+  retrieval_strong_coverage: 0.75
+  retrieval_strong_cosine: 0.6
+  retrieval_strong_cosine_tfidf: 0.28
+  # Radius (m) of the small avoid-polygon drawn around each geocoded at-risk place.
+  at_risk_buffer_m: 400
+
+# ---------------------------------------------------------------------------------------------
+# Feature 6 — action tracker. Due times come from the action's phase and the expected impact
+# time (t*) of the run that proposed it; "Do now" is due a fixed time after approval.
+tracker:
+  do_now_due_h: 2
+  phase_offsets_h: {"T-48h": 48, "T-24h": 24, "T-6h": 6}
+
+# Feature 3 — action readiness. An action's needs are detected from these keywords (matched at
+# word starts, case-insensitive). Plan figures older than plan_max_age_years count as unverified.
+readiness:
+  plan_max_age_years: 1
+  requirements:
+    shelter: [relief camp, relief cent, shelter, evacuat, accommodat, safe place]
+    transport: [vehicle, bus, buses, transport, lorr, truck, tractor, shift]
+    rescue_equipment: [boat, rescue, life jacket, lifebuoy, life buoy, OBM, swimmer]
+    earth_moving: [JCB, earth mover, tree cutt, fallen tree, power saw, debris, clear road, clearance]
+    pumping: [pump, dewater, water logging, waterlogging, stagnat, inundat, drain]
+    staff: [deploy, team, staff, personnel, volunteer, task force, QRT, officer]
+    road_access: [road, route, access, reach, evacuat, transport]
+    backup_power: [generator, backup power, power backup, power supply, diesel, electricity]
+    medical: [hospital, medical, ambulance, health, medicine, PHC, doctor]
+
+# Feature 2 — local impact. The ensemble grid (~25 km) makes the hazard district-wide; local
+# differences come from terrain. These are model weights, not measurements.
+impact:
+  max_cells: 64                 # grid points inside the district boundary
+  name_top_cells: 8             # most-affected cells named via Nominatim (1 request/s, cached)
+  weights: {low_elevation: 0.45, depression: 0.25, river_proximity: 0.30}
+  depression_scale_m: 5         # a cell 5 m below its neighbours scores the full depression weight
+  river_scale_km: 5             # river proximity fades to zero at this distance
+  susceptibility_floor: 0.4     # impact = hazard x (floor + (1 - floor) x susceptibility)
+  saturation_multiplier: 1.2    # hazard multiplier when the ground is saturated (72-h rain)
+  wind_kmh: {cyclonic: 62, severe: 89}   # IMD: cyclonic storm >= 62 km/h, severe cyclonic storm >= 89 km/h
+  wind_model: ecmwf_ifs025
+  classes: {high: 0.5, medium: 0.25, low: 0.1}
+  exposure_weights: {urban: 1.0, village: 0.8, sparse: 0.5, unknown: 0.8}
+  refresh_min: 60
+
+# Feature 4 — critical assets. Measures are suggestions (shown as "Suggested — not in district plan").
+assets:
+  cache_h: 24
+  relocation_types: [grain_storage, cold_storage, seed_store]
+  measures:
+    grain_storage: [Raise stacks onto dunnage or pallets, Cover stock with tarpaulins and seal doors and vents, Move stock to a safer warehouse]
+    cold_storage: [Confirm backup generator and fuel, Move temperature-sensitive stock to a safer facility]
+    seed_store: [Lift seed bags off the floor in waterproof packing, Shift seed stock to higher ground]
+    hospital: [Check backup power and fuel, Stock critical medicines and oxygen, Plan transfer of ground-floor patients]
+    substation: [Agree pre-emptive shutdown and restoration crews with the power utility, Protect control rooms against water entry]
+    water_works: [Fuel backup pumps, Protect pump-house electricals]
+    fuel: [Secure tanks and dispensers, Keep fuel reserved for generators and rescue vehicles]
