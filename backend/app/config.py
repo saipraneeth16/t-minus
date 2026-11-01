@@ -79,7 +79,8 @@ class Settings(BaseSettings):
     imd_enabled: bool = False
     imd_base_url: str = ""
     overpass_url: str = "https://overpass-api.de/api/interpreter"
-    overpass_mirrors: str = "https://overpass.kumi.systems/api/interpreter,https://overpass.private.coffee/api/interpreter"
+    overpass_mirrors: str = ("https://maps.mail.ru/osm/tools/overpass/api/interpreter,"
+                             "https://overpass.private.coffee/api/interpreter")  # kumi.systems is defunct
     nominatim_url: str = "https://nominatim.openstreetmap.org/search"
     nominatim_reverse_url: str = "https://nominatim.openstreetmap.org/reverse"
     ors_url: str = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"

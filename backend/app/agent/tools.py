@@ -28,6 +28,8 @@ from app.sources.osm import FACILITY_TYPES, fetch_facilities, geocode
 
 
 TOOL_TIMEOUT_S = 45.0  # no single tool may stall a run (e.g. an unresponsive Overpass mirror)
+# Overpass is hedged across mirrors with an 85 s budget; give it room to finish instead of being cut off.
+TOOL_TIMEOUTS_S = {"find_facilities": 95.0}
 
 
 class BudgetExceeded(Exception):
@@ -274,25 +276,38 @@ async def t_find_facilities(ctx: ToolContext, args: dict) -> dict:
     row = _district_row(ctx.district_id)
     boundary = row.boundary if row else None
     feats = None
+    stale = None
     with session_scope() as s:
         cached = s.execute(select(FacilityCache).where(FacilityCache.district_id == ctx.district_id,
                                                        FacilityCache.types_key == key)
                            .order_by(FacilityCache.fetched_at.desc()).limit(1)).scalars().first()
         if cached and (utcnow() - _aware(cached.fetched_at)).total_seconds() < 24 * 3600:
             feats, fetch_id, cached_flag = cached.features, cached.fetch_id, True
+        elif cached:
+            stale = (list(cached.features), cached.fetch_id)
+    note = None
     if feats is None:
         from app.sources import registry as _reg
 
-        broken = _reg.recently_failed("overpass", 300)
-        if broken:
-            return {"status": "error", "message": f"OpenStreetMap facilities unavailable — Overpass failed {broken}; "
-                                                  "circuit open for 5 minutes. Proceed without facility data."}
-        box = district_box(d_cfg, boundary)
-        res, feats_all = await fetch_facilities(types, bbox=box)
-        feats = [f for f in feats_all if contains(boundary, f["lat"], f["lon"], d_cfg) is not False]
-        fetch_id, cached_flag = res.fetch_id, False
-        with session_scope() as s:
-            s.add(FacilityCache(district_id=ctx.district_id, types_key=key, fetch_id=fetch_id, features=feats))
+        broken = _reg.recently_failed("overpass", 120)
+        try:
+            if broken:
+                raise SourceError("overpass", f"Overpass failed {broken}; circuit open for 2 minutes")
+            box = district_box(d_cfg, boundary)
+            res, feats_all = await fetch_facilities(types, bbox=box)
+        except SourceError as exc:
+            if exc.simulated or not stale:
+                return {"status": "error", "message": f"OpenStreetMap facilities unavailable — {exc.message}. "
+                                                      "Proceed without facility data.",
+                        "simulated": exc.simulated, "retryable": True}
+            # Facilities barely change day to day: an older real list beats no list.
+            feats, fetch_id, cached_flag = stale[0], stale[1], True
+            note = f"Overpass unreachable ({exc.message[:120]}); using the last fetched list (older than 24 h)."
+        else:
+            feats = [f for f in feats_all if contains(boundary, f["lat"], f["lon"], d_cfg) is not False]
+            fetch_id, cached_flag = res.fetch_id, False
+            with session_scope() as s:
+                s.add(FacilityCache(district_id=ctx.district_id, types_key=key, fetch_id=fetch_id, features=feats))
     for f in feats:
         ctx.facilities[f["id"]] = {**f, "fetch_id": fetch_id}
     named = [f for f in feats if f.get("name")]
@@ -301,7 +316,7 @@ async def t_find_facilities(ctx: ToolContext, args: dict) -> dict:
         counts[f["type"]] = counts.get(f["type"], 0) + 1
     return {"status": "ok", "cached": cached_flag, "fetch_id": fetch_id, "counts": counts,
             "named_examples": [{k: f.get(k) for k in ("id", "name", "type", "lat", "lon")} for f in named[:40]],
-            "unnamed_count": len(feats) - len(named)}
+            "unnamed_count": len(feats) - len(named), **({"note": note} if note else {})}
 
 
 def _aware(t: dt.datetime) -> dt.datetime:
@@ -427,10 +442,11 @@ async def call_tool(ctx: ToolContext, name: str, args: dict, *, by: str = "agent
     ctx.emit("tool_call", {"tool": name, "args": args, "n": ctx.calls, "by": by})
     t0 = time.perf_counter()
     try:
-        out = await asyncio.wait_for(IMPLS[name](ctx, args), timeout=TOOL_TIMEOUT_S)
+        tmo = TOOL_TIMEOUTS_S.get(name, TOOL_TIMEOUT_S)
+        out = await asyncio.wait_for(IMPLS[name](ctx, args), timeout=tmo)
         ok = out.get("status") not in ("error",)
     except asyncio.TimeoutError:
-        out = {"status": "error", "message": f"{name} timed out after {TOOL_TIMEOUT_S:.0f} s (upstream not responding)",
+        out = {"status": "error", "message": f"{name} timed out after {tmo:.0f} s (upstream not responding)",
                "retryable": True}
         ok = False
         ctx.errors.append(out["message"])

@@ -100,28 +100,79 @@ def normalise_elements(payload: dict) -> list[dict]:
 def _validate_overpass(p: Any) -> None:
     if not isinstance(p, dict) or "elements" not in p:
         raise ValueError("missing 'elements'")
+    # Overpass reports server-side timeouts / memory exhaustion as HTTP 200 with a "remark" and a
+    # truncated (often empty) element list. Accepting that would cache "no facilities" for 24 h.
+    remark = str(p.get("remark") or "")
+    if "error" in remark.lower():
+        raise ValueError(f"Overpass remark: {remark[:160]}")
+
+
+def overpass_endpoints() -> list[str]:
+    s = get_settings()
+    urls = [s.overpass_url] + [u.strip() for u in s.overpass_mirrors.split(",") if u.strip()]
+    return list(dict.fromkeys(u for u in urls if u))  # de-duplicated, order kept
+
+
+async def query_overpass(q: str, *, budget_s: float = 85.0, per_try_s: float = 70.0,
+                         stagger_s: float = 8.0) -> FetchResult:
+    """Run one Overpass query against the public mirrors as a *hedged* race.
+
+    The primary is asked first; if it has not answered after ``stagger_s`` seconds (or fails), the
+    next mirror is started too, and so on. The first valid answer wins and the others are cancelled.
+    Public Overpass servers are frequently overloaded (connection resets, 429/504, 20-30 s answers),
+    so trying them strictly one after another with short timeouts used to fail nearly every time.
+    A fast 504/429 from a busy server is retried once (the next try often succeeds, just slowly).
+    """
+    urls = overpass_endpoints()
+    if not urls:
+        raise SourceError("overpass", "no Overpass endpoint configured")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget_s
+    pending: set[asyncio.Task] = set()
+    errors: list[SourceError] = []
+
+    def start(url: str) -> None:
+        left = max(5.0, deadline - loop.time())
+        pending.add(asyncio.create_task(
+            fetch("overpass", url, method="POST", data={"data": q}, validate=_validate_overpass,
+                  timeout_s=min(per_try_s, left), attempts=2, backoff_s=2.0, log_params={"query": q, "endpoint": url})))
+
+    try:
+        start(urls[0])
+        nxt = 1
+        while pending:
+            left = deadline - loop.time()
+            if left <= 0:
+                break
+            wait_for = min(stagger_s, left) if nxt < len(urls) else left
+            done, _ = await asyncio.wait(pending, timeout=wait_for, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                pending.discard(t)
+                exc = t.exception()
+                if exc is None:
+                    return t.result()
+                if isinstance(exc, SourceError) and exc.simulated:  # chaos switch: fail fast
+                    raise exc
+                errors.append(exc if isinstance(exc, SourceError)
+                              else SourceError("overpass", f"{type(exc).__name__}: {exc}"[:300]))
+            # No winner yet: whether a mirror failed or the stagger elapsed, hedge with the next one.
+            if nxt < len(urls):
+                start(urls[nxt])
+                nxt += 1
+    finally:
+        for t in pending:
+            t.cancel()
+    if errors:
+        raise SourceError("overpass", "All Overpass mirrors failed: " +
+                          " | ".join(e.message[:80] for e in errors[-3:]), fetch_id=errors[-1].fetch_id)
+    raise SourceError("overpass", f"Overpass did not answer within {budget_s:.0f} s (all mirrors)", code="timeout")
 
 
 async def fetch_facilities(types: list[str], *, bbox=None, around=None) -> tuple[FetchResult, list[dict]]:
-    """Query Overpass, failing over across public mirrors (each attempt is logged)."""
-    s = get_settings()
-    q = build_overpass_query(types, bbox=bbox, around=around)
-    urls = [s.overpass_url] + [u.strip() for u in s.overpass_mirrors.split(",") if u.strip()]
-    last: SourceError | None = None
-    deadline = time.monotonic() + 40  # total budget across mirrors
-    for url in urls:
-        left = deadline - time.monotonic()
-        if left < 5:
-            break
-        try:
-            res = await fetch("overpass", url, method="POST", data={"data": q}, validate=_validate_overpass,
-                              timeout_s=min(20.0, left), attempts=1, log_params={"query": q, "endpoint": url})
-            return res, normalise_elements(res.payload)
-        except SourceError as exc:
-            last = exc
-            if exc.simulated:
-                break
-    raise last or SourceError("overpass", "no Overpass endpoint configured")
+    """Query Overpass (hedged across public mirrors; each attempt is logged)."""
+    q = build_overpass_query(types, bbox=bbox, around=around, timeout_s=60)
+    res = await query_overpass(q)
+    return res, normalise_elements(res.payload)
 
 
 # ---------------------------------------------------------------------------
@@ -252,15 +303,6 @@ def normalise_assets(payload: dict) -> list[dict]:
 
 
 async def fetch_assets(bbox: tuple[float, float, float, float]) -> tuple[FetchResult, list[dict]]:
-    s = get_settings()
-    q = build_asset_query(bbox)
-    urls = [s.overpass_url] + [u.strip() for u in s.overpass_mirrors.split(",") if u.strip()]
-    last: SourceError | None = None
-    for url in urls:
-        try:
-            res = await fetch("overpass", url, method="POST", data={"data": q}, validate=_validate_overpass,
-                              attempts=1, timeout_s=40)
-            return res, normalise_assets(res.payload)
-        except SourceError as exc:
-            last = exc
-    raise last or SourceError("overpass", "no Overpass endpoint configured")
+    q = build_asset_query(bbox, timeout_s=80)
+    res = await query_overpass(q, budget_s=110.0, per_try_s=90.0)
+    return res, normalise_assets(res.payload)
